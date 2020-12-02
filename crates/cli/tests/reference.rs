@@ -98,8 +98,8 @@ fn runtest(test: &Path) -> Result<()> {
         .arg(td.path())
         .arg(&wasm)
         .arg("--no-typescript");
-    if contents.contains("// enable-anyref") {
-        bindgen.env("WASM_BINDGEN_ANYREF", "1");
+    if contents.contains("// enable-externref") {
+        bindgen.env("WASM_BINDGEN_EXTERNREF", "1");
     }
     if interface_types {
         bindgen.env("WASM_INTERFACE_TYPES", "1");
@@ -151,6 +151,13 @@ fn sanitize_wasm(wasm: &Path) -> Result<String> {
     }
     for mem in module.memories.iter_mut() {
         mem.data_segments.drain();
+    }
+    let ids = module.elements.iter().map(|d| d.id()).collect::<Vec<_>>();
+    for id in ids {
+        module.elements.delete(id);
+    }
+    for table in module.tables.iter_mut() {
+        table.elem_segments.drain();
     }
     let ids = module
         .exports

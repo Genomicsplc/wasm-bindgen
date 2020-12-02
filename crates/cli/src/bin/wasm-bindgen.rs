@@ -22,7 +22,7 @@ Options:
     --out-dir DIR                Output directory
     --out-name VAR               Set a custom output filename (Without extension. Defaults to crate name)
     --target TARGET              What type of output to generate, valid
-                                 values are [web, bundler, nodejs, no-modules],
+                                 values are [web, bundler, nodejs, no-modules, deno],
                                  and the default is [bundler]
     --no-modules-global VAR      Name of the global variable to initialize
     --browser                    Hint that JS should only be compatible with a browser
@@ -39,6 +39,8 @@ Options:
     --nodejs                     Deprecated, use `--target nodejs`
     --web                        Deprecated, use `--target web`
     --no-modules                 Deprecated, use `--target no-modules`
+    --weak-refs                  Enable usage of the JS weak references proposal
+    --reference-types            Enable usage of WebAssembly reference types
     -V --version                 Print the version number of wasm-bindgen
 ";
 
@@ -59,6 +61,8 @@ struct Args {
     flag_no_modules_global: Option<String>,
     flag_remove_name_section: bool,
     flag_remove_producers_section: bool,
+    flag_weak_refs: Option<bool>,
+    flag_reference_types: Option<bool>,
     flag_keep_debug: bool,
     flag_encode_into: Option<String>,
     flag_target: Option<String>,
@@ -98,6 +102,7 @@ fn rmain(args: &Args) -> Result<(), Error> {
             "web" => b.web(true)?,
             "no-modules" => b.no_modules(true)?,
             "nodejs" => b.nodejs(true)?,
+            "deno" => b.deno(true)?,
             s => bail!("invalid encode-into mode: `{}`", s),
         };
     }
@@ -113,6 +118,12 @@ fn rmain(args: &Args) -> Result<(), Error> {
         .remove_producers_section(args.flag_remove_producers_section)
         .typescript(typescript)
         .omit_imports(args.flag_omit_imports);
+    if let Some(true) = args.flag_weak_refs {
+        b.weak_refs(true);
+    }
+    if let Some(true) = args.flag_reference_types {
+        b.reference_types(true);
+    }
     if let Some(ref name) = args.flag_no_modules_global {
         b.no_modules_global(name)?;
     }

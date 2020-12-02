@@ -463,13 +463,6 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
 }
 
 fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) -> Result<(), Error> {
-    // Here first properly aligned nonzero address is chosen to be the
-    // out-pointer. We use the address for a BigInt64Array sometimes which
-    // means it needs to be 8-byte aligned. Otherwise valid code is
-    // unlikely to ever be working around address 8, so this should be a
-    // safe address to use for returning data through.
-    let retptr_val = 8;
-
     match instr {
         Instruction::Standard(wit_walrus::Instruction::ArgGet(n)) => {
             let arg = js.arg(*n).to_string();
@@ -566,7 +559,20 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.string_to_memory(*mem, *malloc, *realloc)?;
         }
 
-        Instruction::Retptr => js.stack.push(retptr_val.to_string()),
+        Instruction::Retptr { size } => {
+            let sp = match js.cx.aux.shadow_stack_pointer {
+                Some(s) => js.cx.export_name_of(s),
+                // In theory this shouldn't happen since malloc is included in
+                // most wasm binaries (and may be gc'd out) and that almost
+                // always pulls in a stack pointer. We can try to synthesize
+                // something here later if necessary.
+                None => bail!("failed to find shadow stack pointer"),
+            };
+            js.prelude(&format!("const retptr = wasm.{}.value - {};", sp, size));
+            js.prelude(&format!("wasm.{}.value = retptr;", sp));
+            js.finally(&format!("wasm.{}.value += {};", sp, size));
+            js.stack.push("retptr".to_string());
+        }
 
         Instruction::StoreRetptr { ty, offset, mem } => {
             let (mem, size) = match ty {
@@ -599,7 +605,7 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             // If we're loading from the return pointer then we must have pushed
             // it earlier, and we always push the same value, so load that value
             // here
-            let expr = format!("{}()[{} / {} + {}]", mem, retptr_val, size, offset);
+            let expr = format!("{}()[retptr / {} + {}]", mem, size, offset);
             js.prelude(&format!("var r{} = {};", offset, expr));
             js.push(format!("r{}", offset));
         }
@@ -616,13 +622,13 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("{}.codePointAt(0)", val));
         }
 
-        Instruction::I32FromAnyrefOwned => {
+        Instruction::I32FromExternrefOwned => {
             js.cx.expose_add_heap_object();
             let val = js.pop();
             js.push(format!("addHeapObject({})", val));
         }
 
-        Instruction::I32FromAnyrefBorrow => {
+        Instruction::I32FromExternrefBorrow => {
             js.cx.expose_borrowed_objects();
             js.cx.expose_global_stack_pointer();
             let val = js.pop();
@@ -630,7 +636,7 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.finally("heap[stack_pointer++] = undefined;");
         }
 
-        Instruction::I32FromAnyrefRustOwned { class } => {
+        Instruction::I32FromExternrefRustOwned { class } => {
             let val = js.pop();
             js.assert_class(&val, &class);
             js.assert_not_moved(&val);
@@ -640,7 +646,7 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("ptr{}", i));
         }
 
-        Instruction::I32FromAnyrefRustBorrow { class } => {
+        Instruction::I32FromExternrefRustBorrow { class } => {
             let val = js.pop();
             js.assert_class(&val, &class);
             js.assert_not_moved(&val);
@@ -707,12 +713,12 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("high{}", i));
         }
 
-        Instruction::I32FromOptionAnyref { table_and_alloc } => {
+        Instruction::I32FromOptionExternref { table_and_alloc } => {
             let val = js.pop();
             js.cx.expose_is_like_none();
             match table_and_alloc {
                 Some((table, alloc)) => {
-                    let alloc = js.cx.expose_add_to_anyref_table(*table, *alloc)?;
+                    let alloc = js.cx.expose_add_to_externref_table(*table, *alloc)?;
                     js.push(format!("isLikeNone({0}) ? 0 : {1}({0})", val, alloc));
                 }
                 None => {
@@ -869,7 +875,7 @@ fn instruction(js: &mut JsBuilder, instr: &Instruction, log_error: &mut bool) ->
             js.push(format!("{} !== 0", val));
         }
 
-        Instruction::AnyrefLoadOwned => {
+        Instruction::ExternrefLoadOwned => {
             js.cx.expose_take_object();
             let val = js.pop();
             js.push(format!("takeObject({})", val));
@@ -1145,18 +1151,9 @@ impl Invocation {
             // The function table never changes right now, so we can statically
             // look up the desired function.
             CallTableElement(idx) => {
-                let table = module
-                    .tables
-                    .main_function_table()?
-                    .ok_or_else(|| anyhow!("no function table found"))?;
-                let functions = match &module.tables.get(table).kind {
-                    walrus::TableKind::Function(f) => f,
-                    _ => bail!("should have found a function table"),
-                };
-                let id = functions
-                    .elements
-                    .get(*idx as usize)
-                    .and_then(|id| *id)
+                let entry = wasm_bindgen_wasm_conventions::get_function_table_entry(module, *idx)?;
+                let id = entry
+                    .func
                     .ok_or_else(|| anyhow!("function table wasn't filled in a {}", idx))?;
                 Invocation::Core { id, defer: false }
             }
@@ -1233,14 +1230,14 @@ fn adapter2ts(ty: &AdapterType, dst: &mut String) {
         | AdapterType::F64 => dst.push_str("number"),
         AdapterType::I64 | AdapterType::S64 | AdapterType::U64 => dst.push_str("BigInt"),
         AdapterType::String => dst.push_str("string"),
-        AdapterType::Anyref => dst.push_str("any"),
+        AdapterType::Externref => dst.push_str("any"),
         AdapterType::Bool => dst.push_str("boolean"),
         AdapterType::Vector(kind) => dst.push_str(kind.js_ty()),
         AdapterType::Option(ty) => {
             adapter2ts(ty, dst);
             dst.push_str(" | undefined");
         }
-        AdapterType::NamedAnyref(name) => dst.push_str(name),
+        AdapterType::NamedExternref(name) => dst.push_str(name),
         AdapterType::Struct(name) => dst.push_str(name),
         AdapterType::Function => dst.push_str("any"),
     }

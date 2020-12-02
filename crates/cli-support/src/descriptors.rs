@@ -107,26 +107,19 @@ impl WasmBindgenDescriptorsSection {
         // For all indirect functions that were closure descriptors, delete them
         // from the function table since we've executed them and they're not
         // necessary in the final binary.
-        let table_id = match interpreter.function_table_id() {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        let table = module.tables.get_mut(table_id);
-        let table = match &mut table.kind {
-            walrus::TableKind::Function(f) => f,
-            _ => unreachable!(),
-        };
-        for idx in element_removal_list {
+        for (segment, idx) in element_removal_list {
             log::trace!("delete element {}", idx);
-            assert!(table.elements[idx].is_some());
-            table.elements[idx] = None;
+            module.elements.get_mut(segment).members[idx] = None;
         }
 
         // And finally replace all calls of `wbindgen_describe_closure` with a
         // freshly manufactured import. Save off the type of this import in
         // ourselves, and then we're good to go.
         let ty = module.funcs.get(wbindgen_describe_closure).ty();
-        for (func, descriptor) in func_to_descriptor {
+        // sort to ensure ids and caches are consistent across runs
+        let mut items = func_to_descriptor.into_iter().collect::<Vec<_>>();
+        items.sort_by_key(|i| i.0);
+        for (func, descriptor) in items {
             // This uses a cache so that if the same closure exists multiple times it will
             // deduplicate it so it only exists once.
             let id = match self.cached_closures.get(&descriptor) {

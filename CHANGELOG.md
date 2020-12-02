@@ -2,6 +2,189 @@
 
 --------------------------------------------------------------------------------
 
+## 0.2.69
+
+Released 2020-11-30.
+
+### Added
+
+* Unstable bindings for WebBluetooth have been added.
+  [#2311](https://github.com/rustwasm/wasm-bindgen/pull/2311)
+
+* Unstable bindings for WebUSB have been added.
+  [#2345](https://github.com/rustwasm/wasm-bindgen/pull/2345)
+
+* Renaming a struct field with `js_name` is now supported.
+  [#2360](https://github.com/rustwasm/wasm-bindgen/pull/2360)
+
+* The WebGPU WebIDL has been updated.
+  [#2353](https://github.com/rustwasm/wasm-bindgen/pull/2353)
+
+### Fixed
+
+* The ImageCapture APIs of web-sys have been moved to unstable and were fixed.
+  [#2348](https://github.com/rustwasm/wasm-bindgen/pull/2348)
+
+* Bindings for `waitAsync` have been updated.
+  [#2362](https://github.com/rustwasm/wasm-bindgen/pull/2362)
+
+--------------------------------------------------------------------------------
+
+## 0.2.68
+
+Released 2020-09-08.
+
+### Added
+
+* Add userVisibleOnly property to PushSubscriptionOptionsInit.
+  [#2288](https://github.com/rustwasm/wasm-bindgen/pull/2288)
+
+### Fixed
+
+* TypeScript files now import `*.wasm` instead of bare files.
+  [#2283](https://github.com/rustwasm/wasm-bindgen/pull/2283)
+
+* Usage of `externref` now appropriately resizes the table by using 2x the
+  previous capacity, fixing a performance issue with lots of externref objects.
+  [#2294](https://github.com/rustwasm/wasm-bindgen/pull/2294)
+
+* Compatibility with the latest Firefox WebDriver has been fixed.
+  [#2301](https://github.com/rustwasm/wasm-bindgen/pull/2301)
+
+* Non deterministic output with closures has been fixed.
+  [#2304](https://github.com/rustwasm/wasm-bindgen/pull/2304)
+
+### Updated
+
+* The WebGPU WebIDL was updated.
+  [#2267](https://github.com/rustwasm/wasm-bindgen/pull/2267)
+
+--------------------------------------------------------------------------------
+
+## 0.2.67
+
+Released 2020-07-28.
+
+### Added
+
+* A `--reference-types` flag was added to the CLI.
+  [#2257](https://github.com/rustwasm/wasm-bindgen/pull/2257)
+
+### Fixed
+
+* Breakage with `Closure::forget` in 0.2.66 was fixed.
+  [#2258](https://github.com/rustwasm/wasm-bindgen/pull/2258)
+
+--------------------------------------------------------------------------------
+
+## 0.2.66
+
+Released 2020-07-28.
+
+### Added
+
+* Reverse mappings from value to name are now available in JS bindings of enums.
+  [#2240](https://github.com/rustwasm/wasm-bindgen/pull/2240)
+
+### Fixed
+
+* Functions using a return pointer in threaded programs now correctly load and
+  store return values in a way that doesn't interfere with other threads.
+  [#2249](https://github.com/rustwasm/wasm-bindgen/pull/2249)
+
+* Support for weak references has been updated and a `--weak-refs` flag is now
+  available in the CLI for enabling weak references.
+  [#2248](https://github.com/rustwasm/wasm-bindgen/pull/2248)
+
+--------------------------------------------------------------------------------
+
+## 0.2.65
+
+Released 2020-07-15.
+
+### Added
+
+* Functions from JS can now be natively imported as `async` and will use
+  promises under the hood.
+  [#2196](https://github.com/rustwasm/wasm-bindgen/pull/2196)
+
+### Changed
+
+* Encoding for the reference types proposal has been updated to the latest
+  version of the spec.
+  [#2234](https://github.com/rustwasm/wasm-bindgen/pull/2234)
+
+--------------------------------------------------------------------------------
+
+## 0.2.64
+
+Released 2020-06-29.
+
+### Added
+
+* Nested namespaces for imports can now be specified.
+  [#2105](https://github.com/rustwasm/wasm-bindgen/pull/2105)
+
+* A `deno` target has been added.
+  [#2176](https://github.com/rustwasm/wasm-bindgen/pull/2176)
+
+### Fixed
+
+* Getters/setters that consume the original object have been fixed to invalidate
+  the object correctly.
+  [#2172](https://github.com/rustwasm/wasm-bindgen/pull/2172)
+
+* Compatibility with nightly threading in LLVM has been fixed.
+  [#2183](https://github.com/rustwasm/wasm-bindgen/pull/2183)
+
+* Trailing space in generated doc comments is now removed.
+  [#2210](https://github.com/rustwasm/wasm-bindgen/pull/2210)
+
+--------------------------------------------------------------------------------
+
+## 0.2.63
+
+Released 2020-05-27.
+
+### Added
+
+* A new example about using WebRTC has been added.
+  [#2131](https://github.com/rustwasm/wasm-bindgen/pull/2131)
+
+* The `Blob.stream()` method has been added.
+  [#2140](https://github.com/rustwasm/wasm-bindgen/pull/2140)
+  [#2142](https://github.com/rustwasm/wasm-bindgen/pull/2142)
+
+### Changed
+
+* The encoding and implementation of WebAssembly reference types has been sync'd
+  with the latest upstream specification.
+  [#2125](https://github.com/rustwasm/wasm-bindgen/pull/2125)
+
+### Fixed
+
+* Test functions names will no longer collide with test intrinsic names.
+  [#2123](https://github.com/rustwasm/wasm-bindgen/pull/2123)
+
+* Fixed warnings with `#[must_use]` types in generated code.
+  [#2144](https://github.com/rustwasm/wasm-bindgen/pull/2144)
+
+* Fixed compatibility with latest Rust nightlies.
+  [#2159](https://github.com/rustwasm/wasm-bindgen/pull/2159)
+
+--------------------------------------------------------------------------------
+
+## 0.2.62
+
+Released 2020-05-01.
+
+### Fixed
+
+* Usage of `require` has been fixed with Webpack 5.
+  [#2115](https://github.com/rustwasm/wasm-bindgen/pull/2115)
+
+--------------------------------------------------------------------------------
+
 ## 0.2.61
 
 Released 2020-04-29.

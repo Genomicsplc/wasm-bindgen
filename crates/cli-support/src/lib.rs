@@ -11,10 +11,10 @@ use walrus::Module;
 
 pub(crate) const PLACEHOLDER_MODULE: &str = "__wbindgen_placeholder__";
 
-mod anyref;
 mod decode;
 mod descriptor;
 mod descriptors;
+mod externref;
 mod intrinsic;
 mod js;
 mod multivalue;
@@ -40,7 +40,7 @@ pub struct Bindgen {
     // Support for the wasm threads proposal, transforms the wasm module to be
     // "ready to be instantiated on any thread"
     threads: wasm_bindgen_threads_xform::Config,
-    anyref: bool,
+    externref: bool,
     multi_value: bool,
     wasm_interface_types: bool,
     encode_into: EncodeInto,
@@ -74,6 +74,7 @@ enum OutputMode {
     Web,
     NoModules { global: String },
     Node { experimental_modules: bool },
+    Deno,
 }
 
 enum Input {
@@ -90,7 +91,8 @@ pub enum EncodeInto {
 
 impl Bindgen {
     pub fn new() -> Bindgen {
-        let anyref = env::var("WASM_BINDGEN_ANYREF").is_ok();
+        let externref =
+            env::var("WASM_BINDGEN_ANYREF").is_ok() || env::var("WASM_BINDGEN_EXTERNREF").is_ok();
         let wasm_interface_types = env::var("WASM_INTERFACE_TYPES").is_ok();
         let multi_value = env::var("WASM_BINDGEN_MULTI_VALUE").is_ok();
         Bindgen {
@@ -109,7 +111,7 @@ impl Bindgen {
             emit_start: true,
             weak_refs: env::var("WASM_BINDGEN_WEAKREF").is_ok(),
             threads: threads_config(),
-            anyref: anyref || wasm_interface_types,
+            externref: externref || wasm_interface_types,
             multi_value: multi_value || wasm_interface_types,
             wasm_interface_types,
             encode_into: EncodeInto::Test,
@@ -123,6 +125,16 @@ impl Bindgen {
 
     pub fn out_name(&mut self, name: &str) -> &mut Bindgen {
         self.out_name = Some(name.to_string());
+        self
+    }
+
+    pub fn weak_refs(&mut self, enable: bool) -> &mut Bindgen {
+        self.weak_refs = enable;
+        self
+    }
+
+    pub fn reference_types(&mut self, enable: bool) -> &mut Bindgen {
+        self.externref = enable;
         self
     }
 
@@ -205,6 +217,14 @@ impl Bindgen {
                 OutputMode::Bundler { browser_only } => *browser_only = true,
                 _ => bail!("cannot specify `--browser` with other output types"),
             }
+        }
+        Ok(self)
+    }
+
+    pub fn deno(&mut self, deno: bool) -> Result<&mut Bindgen, Error> {
+        if deno {
+            self.switch_mode(OutputMode::Deno, "--target deno")?;
+            self.encode_into(EncodeInto::Always);
         }
         Ok(self)
     }
@@ -300,23 +320,6 @@ impl Bindgen {
             }
         };
 
-        // This isn't the hardest thing in the world too support but we
-        // basically don't know how to rationalize #[wasm_bindgen(start)] and
-        // the actual `start` function if present. Figure this out later if it
-        // comes up, but otherwise we should continue to be compatible with
-        // LLVM's output today.
-        //
-        // Note that start function handling in `js/mod.rs` will need to be
-        // updated as well, because `#[wasm_bindgen(start)]` is inserted *after*
-        // a module's start function, if any, because we assume start functions
-        // only show up when injected on behalf of wasm-bindgen's passes.
-        if module.start.is_some() {
-            bail!(
-                "wasm-bindgen is currently incompatible with modules that \
-                 already have a start function"
-            );
-        }
-
         self.threads
             .run(&mut module)
             .with_context(|| "failed to prepare module for threading")?;
@@ -347,32 +350,37 @@ impl Bindgen {
         // interface types.
         wit::process(
             &mut module,
-            self.anyref,
+            self.externref,
             self.wasm_interface_types,
             self.emit_start,
         )?;
 
         // Now that we've got type information from the webidl processing pass,
-        // touch up the output of rustc to insert anyref shims where necessary.
-        // This is only done if the anyref pass is enabled, which it's
-        // currently off-by-default since `anyref` is still in development in
+        // touch up the output of rustc to insert externref shims where necessary.
+        // This is only done if the externref pass is enabled, which it's
+        // currently off-by-default since `externref` is still in development in
         // engines.
         //
-        // If the anyref pass isn't necessary, then we blanket delete the
-        // export of all our anyref intrinsics which will get cleaned up in the
+        // If the externref pass isn't necessary, then we blanket delete the
+        // export of all our externref intrinsics which will get cleaned up in the
         // GC pass before JS generation.
-        if self.anyref {
-            anyref::process(&mut module)?;
+        if self.externref {
+            externref::process(&mut module)?;
         } else {
             let ids = module
                 .exports
                 .iter()
-                .filter(|e| e.name.starts_with("__anyref"))
+                .filter(|e| e.name.starts_with("__externref"))
                 .map(|e| e.id())
                 .collect::<Vec<_>>();
             for id in ids {
                 module.exports.delete(id);
             }
+            // Clean up element segments as well if they have holes in them
+            // after some of our transformations, because non-externref engines
+            // only support contiguous arrays of function references in element
+            // segments.
+            externref::force_contiguous_elements(&mut module)?;
         }
 
         // If wasm interface types are enabled then the `__wbindgen_throw`
@@ -520,7 +528,8 @@ impl OutputMode {
             | OutputMode::Web
             | OutputMode::Node {
                 experimental_modules: true,
-            } => true,
+            }
+            | OutputMode::Deno => true,
             _ => false,
         }
     }
@@ -548,25 +557,9 @@ impl OutputMode {
         }
     }
 
-    fn always_run_in_browser(&self) -> bool {
-        match self {
-            OutputMode::Web => true,
-            OutputMode::NoModules { .. } => true,
-            OutputMode::Bundler { browser_only } => *browser_only,
-            _ => false,
-        }
-    }
-
     fn web(&self) -> bool {
         match self {
             OutputMode::Web => true,
-            _ => false,
-        }
-    }
-
-    fn bundler(&self) -> bool {
-        match self {
-            OutputMode::Bundler { .. } => true,
             _ => false,
         }
     }
@@ -709,7 +702,7 @@ impl Output {
         }
 
         if gen.typescript {
-            let ts_path = wasm_path.with_extension("d.ts");
+            let ts_path = wasm_path.with_extension("wasm.d.ts");
             let ts = wasm2es6js::typescript(&self.module)?;
             fs::write(&ts_path, ts)
                 .with_context(|| format!("failed to write `{}`", ts_path.display()))?;

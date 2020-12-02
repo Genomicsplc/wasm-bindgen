@@ -143,7 +143,8 @@ impl<'a> Context<'a> {
             | OutputMode::Node {
                 experimental_modules: true,
             }
-            | OutputMode::Web => {
+            | OutputMode::Web
+            | OutputMode::Deno => {
                 if contents.starts_with("function") {
                     let body = &contents[8..];
                     if export_name == definition_name {
@@ -269,6 +270,63 @@ impl<'a> Context<'a> {
         reset_indentation(&shim)
     }
 
+    // generates somthing like
+    // ```js
+    // import * as import0 from './snippets/.../inline1.js';
+    // ```,
+    //
+    // ```js
+    // const imports = {
+    //   __wbindgen_placeholder__: {
+    //     __wbindgen_throw: function(..) { .. },
+    //     ..
+    //   },
+    //   './snippets/deno-65e2634a84cc3c14/inline1.js': import0,
+    // }
+    // ```
+    fn generate_deno_imports(&self) -> (String, String) {
+        let mut imports = String::new();
+        let mut wasm_import_object = "const imports = {\n".to_string();
+
+        wasm_import_object.push_str(&format!("  {}: {{\n", crate::PLACEHOLDER_MODULE));
+
+        for (id, js) in crate::sorted_iter(&self.wasm_import_definitions) {
+            let import = self.module.imports.get(*id);
+            wasm_import_object.push_str(&format!("{}: {},\n", &import.name, js.trim()));
+        }
+
+        wasm_import_object.push_str("\t},\n");
+
+        // e.g. snippets without parameters
+        let import_modules = self
+            .module
+            .imports
+            .iter()
+            .map(|import| &import.module)
+            .filter(|module| module.as_str() != PLACEHOLDER_MODULE);
+        for (i, module) in import_modules.enumerate() {
+            imports.push_str(&format!("import * as import{} from '{}'\n", i, module));
+            wasm_import_object.push_str(&format!("  '{}': import{},", module, i))
+        }
+
+        wasm_import_object.push_str("\n};\n\n");
+
+        (imports, wasm_import_object)
+    }
+
+    fn generate_deno_wasm_loading(&self, module_name: &str) -> String {
+        // Deno removed support for .wasm imports in https://github.com/denoland/deno/pull/5135
+        // the issue for bringing it back is https://github.com/denoland/deno/issues/5609.
+        format!(
+            "const file = new URL(import.meta.url).pathname;
+            const wasmFile = file.substring(0, file.lastIndexOf(Deno.build.os === 'windows' ? '\\\\' : '/') + 1) + '{}_bg.wasm';
+            const wasmModule = new WebAssembly.Module(Deno.readFileSync(wasmFile));
+            const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+            const wasm = wasmInstance.exports;",
+            module_name
+        )
+    }
+
     /// Performs the task of actually generating the final JS module, be it
     /// `--target no-modules`, `--target web`, or for bundlers. This is the very
     /// last step performed in `finalize`.
@@ -325,6 +383,18 @@ impl<'a> Context<'a> {
                         module_name
                     ))),
                 );
+
+                if needs_manual_start {
+                    footer.push_str("wasm.__wbindgen_start();\n");
+                }
+            }
+
+            OutputMode::Deno => {
+                let (js_imports, wasm_import_object) = self.generate_deno_imports();
+                imports.push_str(&js_imports);
+                footer.push_str(&wasm_import_object);
+
+                footer.push_str(&self.generate_deno_wasm_loading(module_name));
 
                 if needs_manual_start {
                     footer.push_str("wasm.__wbindgen_start();\n");
@@ -443,7 +513,8 @@ impl<'a> Context<'a> {
             | OutputMode::Node {
                 experimental_modules: true,
             }
-            | OutputMode::Web => {
+            | OutputMode::Web
+            | OutputMode::Deno => {
                 for (module, items) in crate::sorted_iter(&self.js_imports) {
                     imports.push_str("import { ");
                     for (i, (item, rename)) in items.iter().enumerate() {
@@ -710,7 +781,7 @@ impl<'a> Context<'a> {
                 ",
                 name,
                 if self.config.weak_refs {
-                    format!("{}FinalizationGroup.register(obj, obj.ptr, obj.ptr);", name)
+                    format!("{}Finalization.register(obj, obj.ptr, obj);", name)
                 } else {
                     String::new()
                 },
@@ -719,13 +790,7 @@ impl<'a> Context<'a> {
 
         if self.config.weak_refs {
             self.global(&format!(
-                "
-                const {}FinalizationGroup = new FinalizationGroup((items) => {{
-                    for (const ptr of items) {{
-                        wasm.{}(ptr);
-                    }}
-                }});
-                ",
+                "const {}Finalization = new FinalizationRegistry(ptr => wasm.{}(ptr));",
                 name,
                 wasm_bindgen_shared::free_function(&name),
             ));
@@ -789,7 +854,7 @@ impl<'a> Context<'a> {
             }}
             ",
             if self.config.weak_refs {
-                format!("{}FinalizationGroup.unregister(ptr);", name)
+                format!("{}Finalization.unregister(this);", name)
             } else {
                 String::new()
             },
@@ -858,7 +923,7 @@ impl<'a> Context<'a> {
         if !self.should_write_global("heap") {
             return;
         }
-        assert!(!self.config.anyref);
+        assert!(!self.config.externref);
         self.global(&format!(
             "const heap = new Array({}).fill(undefined);",
             INITIAL_HEAP_OFFSET
@@ -937,37 +1002,6 @@ impl<'a> Context<'a> {
         } else {
             ""
         };
-
-        // If we are targeting Node.js, it doesn't have `encodeInto` yet
-        // but it does have `Buffer::write` which has similar semantics but
-        // doesn't require creating intermediate view using `subarray`
-        // and also has `Buffer::byteLength` to calculate size upfront.
-        if self.config.mode.nodejs() {
-            let get_buf = self.expose_node_buffer_memory(memory);
-            let ret = MemView {
-                name: "passStringToWasm",
-                num: get_buf.num,
-            };
-            if !self.should_write_global(ret.to_string()) {
-                return Ok(ret);
-            }
-
-            self.global(&format!(
-                "
-                    function {}(arg, malloc) {{
-                        {}
-                        const len = Buffer.byteLength(arg);
-                        const ptr = malloc(len);
-                        {}().write(arg, ptr, len);
-                        WASM_VECTOR_LEN = len;
-                        return ptr;
-                    }}
-                ",
-                ret, debug, get_buf,
-            ));
-
-            return Ok(ret);
-        }
 
         let mem = self.expose_uint8_memory(memory);
         let ret = MemView {
@@ -1143,11 +1177,11 @@ impl<'a> Context<'a> {
             return Ok(ret);
         }
         self.expose_wasm_vector_len();
-        match (self.aux.anyref_table, self.aux.anyref_alloc) {
+        match (self.aux.externref_table, self.aux.externref_alloc) {
             (Some(table), Some(alloc)) => {
-                // TODO: using `addToAnyrefTable` goes back and forth between wasm
+                // TODO: using `addToExternrefTable` goes back and forth between wasm
                 // and JS a lot, we should have a bulk operation for this.
-                let add = self.expose_add_to_anyref_table(table, alloc)?;
+                let add = self.expose_add_to_externref_table(table, alloc)?;
                 self.global(&format!(
                     "
                         function {}(array, malloc) {{
@@ -1238,27 +1272,36 @@ impl<'a> Context<'a> {
     }
 
     fn expose_text_processor(&mut self, s: &str, args: &str) -> Result<(), Error> {
-        if self.config.mode.nodejs() {
-            let name = self.import_name(&JsImport {
-                name: JsImportName::Module {
-                    module: "util".to_string(),
-                    name: s.to_string(),
-                },
-                fields: Vec::new(),
-            })?;
-            self.global(&format!("let cached{} = new {}{};", s, name, args));
-        } else if !self.config.mode.always_run_in_browser() {
-            self.global(&format!(
-                "
+        match &self.config.mode {
+            OutputMode::Node { .. } => {
+                let name = self.import_name(&JsImport {
+                    name: JsImportName::Module {
+                        module: "util".to_string(),
+                        name: s.to_string(),
+                    },
+                    fields: Vec::new(),
+                })?;
+                self.global(&format!("let cached{} = new {}{};", s, name, args));
+            }
+            OutputMode::Bundler {
+                browser_only: false,
+            } => {
+                self.global(&format!(
+                    "
                     const l{0} = typeof {0} === 'undefined' ? \
                         (0, module.require)('util').{0} : {0};\
                 ",
-                s
-            ));
-            self.global(&format!("let cached{0} = new l{0}{1};", s, args));
-        } else {
-            self.global(&format!("let cached{0} = new {0}{1};", s, args));
-        }
+                    s
+                ));
+                self.global(&format!("let cached{0} = new l{0}{1};", s, args));
+            }
+            OutputMode::Deno
+            | OutputMode::Web
+            | OutputMode::NoModules { .. }
+            | OutputMode::Bundler { browser_only: true } => {
+                self.global(&format!("let cached{0} = new {0}{1};", s, args))
+            }
+        };
 
         Ok(())
     }
@@ -1341,7 +1384,7 @@ impl<'a> Context<'a> {
         if !self.should_write_global(ret.to_string()) {
             return Ok(ret);
         }
-        match (self.aux.anyref_table, self.aux.anyref_drop_slice) {
+        match (self.aux.externref_table, self.aux.externref_drop_slice) {
             (Some(table), Some(drop)) => {
                 let table = self.export_name_of(table);
                 let drop = self.export_name_of(drop);
@@ -1458,10 +1501,6 @@ impl<'a> Context<'a> {
         return ret;
     }
 
-    fn expose_node_buffer_memory(&mut self, memory: MemoryId) -> MemView {
-        self.memview("getNodeBufferMemory", "Buffer.from", memory)
-    }
-
     fn expose_int8_memory(&mut self, memory: MemoryId) -> MemView {
         self.memview("getInt8Memory", "new Int8Array", memory)
     }
@@ -1520,7 +1559,7 @@ impl<'a> Context<'a> {
             VectorKind::U64 => self.expose_uint64_memory(memory),
             VectorKind::F32 => self.expose_f32_memory(memory),
             VectorKind::F64 => self.expose_f64_memory(memory),
-            VectorKind::Anyref => self.expose_uint32_memory(memory),
+            VectorKind::Externref => self.expose_uint32_memory(memory),
         }
     }
 
@@ -1665,9 +1704,9 @@ impl<'a> Context<'a> {
             .exn_store
             .ok_or_else(|| anyhow!("failed to find `__wbindgen_exn_store` intrinsic"))?;
         let store = self.export_name_of(store);
-        match (self.aux.anyref_table, self.aux.anyref_alloc) {
+        match (self.aux.externref_table, self.aux.externref_alloc) {
             (Some(table), Some(alloc)) => {
-                let add = self.expose_add_to_anyref_table(table, alloc)?;
+                let add = self.expose_add_to_externref_table(table, alloc)?;
                 self.global(&format!(
                     "
                     function handleError(f) {{
@@ -1750,7 +1789,7 @@ impl<'a> Context<'a> {
             VectorKind::I64 | VectorKind::U64 => self.expose_pass_array64_to_wasm(memory),
             VectorKind::F32 => self.expose_pass_array_f32_to_wasm(memory),
             VectorKind::F64 => self.expose_pass_array_f64_to_wasm(memory),
-            VectorKind::Anyref => self.expose_pass_array_jsvalue_to_wasm(memory),
+            VectorKind::Externref => self.expose_pass_array_jsvalue_to_wasm(memory),
         }
     }
 
@@ -1772,7 +1811,7 @@ impl<'a> Context<'a> {
             VectorKind::U64 => self.expose_get_array_u64_from_wasm(memory),
             VectorKind::F32 => self.expose_get_array_f32_from_wasm(memory),
             VectorKind::F64 => self.expose_get_array_f64_from_wasm(memory),
-            VectorKind::Anyref => self.expose_get_array_js_value_from_wasm(memory)?,
+            VectorKind::Externref => self.expose_get_array_js_value_from_wasm(memory)?,
         })
     }
 
@@ -1858,6 +1897,16 @@ impl<'a> Context<'a> {
 
         let table = self.export_function_table()?;
 
+        let (register, unregister) = if self.config.weak_refs {
+            self.expose_closure_finalization()?;
+            (
+                "CLOSURE_DTORS.register(real, state, state);",
+                "CLOSURE_DTORS.unregister(state)",
+            )
+        } else {
+            ("", "")
+        };
+
         // For mutable closures they can't be invoked recursively.
         // To handle that we swap out the `this.a` pointer with zero
         // while we invoke it. If we finish and the closure wasn't
@@ -1866,7 +1915,7 @@ impl<'a> Context<'a> {
         self.global(&format!(
             "
             function makeMutClosure(arg0, arg1, dtor, f) {{
-                const state = {{ a: arg0, b: arg1, cnt: 1 }};
+                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
                 const real = (...args) => {{
                     // First up with a closure we increment the internal reference
                     // count. This ensures that the Rust closure environment won't
@@ -1877,15 +1926,22 @@ impl<'a> Context<'a> {
                     try {{
                         return f(a, state.b, ...args);
                     }} finally {{
-                        if (--state.cnt === 0) wasm.{}.get(dtor)(a, state.b);
-                        else state.a = a;
+                        if (--state.cnt === 0) {{
+                            wasm.{table}.get(state.dtor)(a, state.b);
+                            {unregister}
+                        }} else {{
+                            state.a = a;
+                        }}
                     }}
                 }};
                 real.original = state;
+                {register}
                 return real;
             }}
             ",
-            table
+            table = table,
+            register = register,
+            unregister = unregister,
         ));
 
         Ok(())
@@ -1898,6 +1954,16 @@ impl<'a> Context<'a> {
 
         let table = self.export_function_table()?;
 
+        let (register, unregister) = if self.config.weak_refs {
+            self.expose_closure_finalization()?;
+            (
+                "CLOSURE_DTORS.register(real, state, state);",
+                "CLOSURE_DTORS.unregister(state)",
+            )
+        } else {
+            ("", "")
+        };
+
         // For shared closures they can be invoked recursively so we
         // just immediately pass through `this.a`. If we end up
         // executing the destructor, however, we clear out the
@@ -1906,7 +1972,7 @@ impl<'a> Context<'a> {
         self.global(&format!(
             "
             function makeClosure(arg0, arg1, dtor, f) {{
-                const state = {{ a: arg0, b: arg1, cnt: 1 }};
+                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
                 const real = (...args) => {{
                     // First up with a closure we increment the internal reference
                     // count. This ensures that the Rust closure environment won't
@@ -1916,21 +1982,42 @@ impl<'a> Context<'a> {
                         return f(state.a, state.b, ...args);
                     }} finally {{
                         if (--state.cnt === 0) {{
-                            wasm.{}.get(dtor)(state.a, state.b);
+                            wasm.{table}.get(state.dtor)(state.a, state.b);
                             state.a = 0;
+                            {unregister}
                         }}
                     }}
                 }};
                 real.original = state;
+                {register}
                 return real;
             }}
+            ",
+            table = table,
+            register = register,
+            unregister = unregister,
+        ));
+
+        Ok(())
+    }
+
+    fn expose_closure_finalization(&mut self) -> Result<(), Error> {
+        if !self.should_write_global("closure_finalization") {
+            return Ok(());
+        }
+        assert!(self.config.weak_refs);
+        let table = self.export_function_table()?;
+        self.global(&format!(
+            "
+            const CLOSURE_DTORS = new FinalizationRegistry(state => {{
+                wasm.{}.get(state.dtor)(state.a, state.b)
+            }});
             ",
             table
         ));
 
         Ok(())
     }
-
     fn global(&mut self, s: &str) {
         let s = s.trim();
 
@@ -1998,7 +2085,7 @@ impl<'a> Context<'a> {
 
             JsImportName::VendorPrefixed { name, prefixes } => {
                 self.imports_post.push_str("const l");
-                self.imports_post.push_str(&name);
+                self.imports_post.push_str(name);
                 self.imports_post.push_str(" = ");
                 switch(&mut self.imports_post, name, "", prefixes);
                 self.imports_post.push_str(";\n");
@@ -2052,13 +2139,13 @@ impl<'a> Context<'a> {
         true
     }
 
-    fn expose_add_to_anyref_table(
+    fn expose_add_to_externref_table(
         &mut self,
         table: TableId,
         alloc: FunctionId,
     ) -> Result<MemView, Error> {
-        let view = self.memview_table("addToAnyrefTable", table);
-        assert!(self.config.anyref);
+        let view = self.memview_table("addToExternrefTable", table);
+        assert!(self.config.externref);
         if !self.should_write_global(view.to_string()) {
             return Ok(view);
         }
@@ -2190,10 +2277,9 @@ impl<'a> Context<'a> {
                     AuxExportKind::Function(_) => {}
                     AuxExportKind::StaticFunction { .. } => {}
                     AuxExportKind::Constructor(class) => builder.constructor(class),
-                    AuxExportKind::Getter { .. } | AuxExportKind::Setter { .. } => {
-                        builder.method(false)
-                    }
-                    AuxExportKind::Method { consumed, .. } => builder.method(*consumed),
+                    AuxExportKind::Getter { consumed, .. }
+                    | AuxExportKind::Setter { consumed, .. }
+                    | AuxExportKind::Method { consumed, .. } => builder.method(*consumed),
                 }
             }
             Kind::Import(_) => {}
@@ -2257,7 +2343,7 @@ impl<'a> Context<'a> {
                         exported.has_constructor = true;
                         exported.push(&docs, "constructor", "", &code, ts_sig);
                     }
-                    AuxExportKind::Getter { class, field } => {
+                    AuxExportKind::Getter { class, field, .. } => {
                         let ret_ty = match export.generate_typescript {
                             true => match &ts_ret_ty {
                                 Some(s) => Some(s.as_str()),
@@ -2268,7 +2354,7 @@ impl<'a> Context<'a> {
                         let exported = require_class(&mut self.exported_classes, class);
                         exported.push_getter(&docs, field, &code, ret_ty);
                     }
-                    AuxExportKind::Setter { class, field } => {
+                    AuxExportKind::Setter { class, field, .. } => {
                         let arg_ty = match export.generate_typescript {
                             true => Some(ts_arg_tys[0].as_str()),
                             false => None,
@@ -2814,11 +2900,6 @@ impl<'a> Context<'a> {
                 "false".to_string()
             }
 
-            Intrinsic::CallbackForget => {
-                assert_eq!(args.len(), 1);
-                args[0].clone()
-            }
-
             Intrinsic::NumberNew => {
                 assert_eq!(args.len(), 1);
                 args[0].clone()
@@ -2921,7 +3002,7 @@ impl<'a> Context<'a> {
                 "JSON.stringify(obj === undefined ? null : obj)".to_string()
             }
 
-            Intrinsic::AnyrefHeapLiveCount => {
+            Intrinsic::ExternrefHeapLiveCount => {
                 assert_eq!(args.len(), 0);
                 self.expose_global_heap();
                 prelude.push_str(
@@ -2941,11 +3022,11 @@ impl<'a> Context<'a> {
                 )
             }
 
-            Intrinsic::InitAnyrefTable => {
+            Intrinsic::InitExternrefTable => {
                 let table = self
                     .aux
-                    .anyref_table
-                    .ok_or_else(|| anyhow!("must enable anyref to use anyref intrinsic"))?;
+                    .externref_table
+                    .ok_or_else(|| anyhow!("must enable externref to use externref intrinsic"))?;
                 let name = self.export_name_of(table);
                 // Grow the table to insert our initial values, and then also
                 // set the 0th slot to `undefined` since that's what we've
@@ -2989,6 +3070,7 @@ impl<'a> Context<'a> {
                 variants.push_str(&variant_docs);
             }
             variants.push_str(&format!("{}:{},", name, value));
+            variants.push_str(&format!("\"{}\":\"{}\",", value, name));
             if enum_.generate_typescript {
                 self.typescript.push_str("\n");
                 if !variant_docs.is_empty() {
@@ -3247,20 +3329,24 @@ fn check_duplicated_getter_and_setter_names(
                     AuxExportKind::Getter {
                         class: first_class,
                         field: first_field,
+                        consumed: _,
                     },
                     AuxExportKind::Getter {
                         class: second_class,
                         field: second_field,
+                        consumed: _,
                     },
                 ) => verify_exports(first_class, first_field, second_class, second_field)?,
                 (
                     AuxExportKind::Setter {
                         class: first_class,
                         field: first_field,
+                        consumed: _,
                     },
                     AuxExportKind::Setter {
                         class: second_class,
                         field: second_field,
+                        consumed: _,
                     },
                 ) => verify_exports(first_class, first_field, second_class, second_field)?,
                 _ => {}
@@ -3273,7 +3359,7 @@ fn check_duplicated_getter_and_setter_names(
 fn format_doc_comments(comments: &str, js_doc_comments: Option<String>) -> String {
     let body: String = comments.lines().map(|c| format!("*{}\n", c)).collect();
     let doc = if let Some(docs) = js_doc_comments {
-        docs.lines().map(|l| format!("* {} \n", l)).collect()
+        docs.lines().map(|l| format!("* {}\n", l)).collect()
     } else {
         String::new()
     };
