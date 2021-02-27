@@ -695,10 +695,13 @@ impl<'a> Context<'a> {
         for (i, extra) in extra_modules.iter().enumerate() {
             let imports = match &mut imports {
                 Some(list) => list,
-                None => bail!(
-                    "cannot import from modules (`{}`) with `--no-modules`",
-                    extra
-                ),
+                None => {
+                    continue;
+                    // bail!(
+                    //     "cannot import from modules (`{}`) with `--no-modules`",
+                    //     extra
+                    // );
+                },
             };
             imports.push_str(&format!("import * as __wbg_star{} from '{}';\n", i, extra));
             imports_init.push_str(&format!("imports['{}'] = __wbg_star{};\n", extra, i));
@@ -746,6 +749,7 @@ impl<'a> Context<'a> {
                 async function init(input{init_memory_arg}) {{
                     {default_module_path}
                     const imports = {{}};
+                    imports.wasi_snapshot_preview1 = WASIPolyfill;
                     {imports_init}
 
                     if (typeof input === 'string' || (typeof Request === 'function' && input instanceof Request) || (typeof URL === 'function' && input instanceof URL)) {{
